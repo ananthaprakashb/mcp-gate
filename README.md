@@ -21,7 +21,10 @@ export GATE_ROUTES='[
     "path_prefix":"/v1/tickets",
     "methods":["POST"],
     "max_ttl_seconds":30,
-    "upstream_bearer":"external-api-secret",
+    "upstream_auth":{
+      "headers":{"X-API-Key":"external-api-secret"},
+      "query":{"tenant":"agents"}
+    },
     "request_schema":{
       "type":"object",
       "properties":{
@@ -58,10 +61,32 @@ curl -sS http://localhost:8080/proxy/tickets/v1/tickets \
 - Object schemas are closed by design; unknown properties are rejected at every
   object level. Supported constraints are `type`, `properties`, `required`,
   `items`, `enum`, `pattern`, string lengths, numeric bounds, and array lengths.
-- Upstream bearer secrets never appear in capability tokens or responses.
+- Upstream credentials never appear in capability tokens or responses. Routes
+  can inject a bearer token, Basic Auth, fixed headers, and fixed query values.
+- Non-2xx upstream bodies are replaced with a stable JSON error so stack traces,
+  internal hostnames, and sensitive response data are not leaked.
 - Request and response bodies are bounded (1 MiB by default); hop-by-hop and
   caller-supplied authentication headers are not forwarded.
 
-Replay state is in memory, so deploy a single instance or add shared replay
-storage before horizontally scaling. TLS termination and rate limiting should
-be supplied by the surrounding ingress.
+`GET /healthz` and `GET /readyz` provide liveness and readiness probes. Logs from
+the executable use Go's structured `slog` format.
+
+## Distributed replay protection
+
+The default replay store is process-local. Applications embedding `gate` can
+provide `Config.ReplayStore`, whose atomic `Consume` operation is suitable for
+a Redis/Valkey `SET key value NX EX ttl` adapter. Store errors fail closed with
+HTTP 503, so a backend outage cannot silently disable single-use enforcement.
+
+## Container
+
+Build and run the non-root distroless image:
+
+```sh
+docker build -t mcp-gate .
+docker run --rm -p 8080:8080 \
+  -e GATE_SIGNING_KEY -e GATE_ADMIN_KEY -e GATE_ROUTES mcp-gate
+```
+
+TLS termination and rate limiting should be supplied by the surrounding
+ingress.

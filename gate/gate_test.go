@@ -1,6 +1,7 @@
 package gate
 
 import (
+	"context"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -9,6 +10,12 @@ import (
 	"testing"
 	"time"
 )
+
+type failingReplayStore struct{}
+
+func (failingReplayStore) Consume(context.Context, string, time.Time) (bool, error) {
+	return false, io.ErrClosedPipe
+}
 
 func TestIssueProxyAndPreventReplay(t *testing.T) {
 	var gotAuth string
@@ -22,7 +29,7 @@ func TestIssueProxyAndPreventReplay(t *testing.T) {
 	g, err := New(Config{
 		SigningKey: strings.Repeat("s", 32), AdminKey: "admin", Now: func() time.Time { return now },
 		Routes: []Route{{
-			Name: "tickets", Upstream: upstream, PathPrefix: "/tickets", Methods: []string{"POST"}, MaxTTLSeconds: 30, UpstreamBearer: "secret",
+			Name: "tickets", Upstream: upstream.URL, PathPrefix: "/tickets", Methods: []string{"POST"}, MaxTTLSeconds: 30, UpstreamBearer: "secret",
 			RequestSchema: &Schema{Type: "object", Properties: map[string]*Schema{"title": &Schema{Type: "string"}}, Required: []string{"title"}},
 		}},
 	})
@@ -60,6 +67,67 @@ func TestIssueProxyAndPreventReplay(t *testing.T) {
 	}
 	if w := call(`{"title":"again"}`); w.Code != 401 {
 		t.Fatalf("replay status=%d", w.Code)
+	}
+}
+
+func TestHealthEndpoints(t *testing.T) {
+	g, err := New(Config{SigningKey: strings.Repeat("s", 32), AdminKey: "admin"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range []string{"/healthz", "/readyz"} {
+		w := httptest.NewRecorder()
+		g.ServeHTTP(w, httptest.NewRequest(http.MethodGet, path, nil))
+		if w.Code != http.StatusOK || w.Body.String() != "{\"status\":\"ok\"}\n" {
+			t.Fatalf("%s: status=%d body=%q", path, w.Code, w.Body.String())
+		}
+	}
+}
+
+func TestUpstreamAuthAndSafeErrors(t *testing.T) {
+	var gotHeader, gotQuery, gotUser, gotPass string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotHeader, gotQuery = r.Header.Get("X-API-Key"), r.URL.Query().Get("tenant")
+		gotUser, gotPass, _ = r.BasicAuth()
+		http.Error(w, "private stack trace: database.internal", http.StatusBadGateway)
+	}))
+	defer upstream.Close()
+	g, err := New(Config{SigningKey: strings.Repeat("s", 32), AdminKey: "admin", Routes: []Route{{
+		Name: "x", Upstream: upstream.URL, PathPrefix: "/x", Methods: []string{"POST"}, MaxTTLSeconds: 30,
+		RequestSchema: &Schema{Type: "object", Properties: map[string]*Schema{}},
+		UpstreamAuth:  UpstreamAuth{BasicUser: "user", BasicPass: "pass", Headers: map[string]string{"X-API-Key": "secret"}, Query: map[string]string{"tenant": "acme"}},
+	}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	token, _ := g.sign(claims{Route: "x", Method: "POST", Path: "/x", JTI: "safe", Exp: time.Now().Add(time.Minute).Unix()})
+	r := httptest.NewRequest("POST", "/proxy/x/x", strings.NewReader(`{}`))
+	r.Header.Set("Authorization", "Bearer "+token)
+	w := httptest.NewRecorder()
+	g.ServeHTTP(w, r)
+	if gotHeader != "secret" || gotQuery != "acme" || gotUser != "user" || gotPass != "pass" {
+		t.Fatalf("auth was not injected")
+	}
+	if w.Code != http.StatusBadGateway || strings.Contains(w.Body.String(), "database.internal") {
+		t.Fatalf("unsafe response: %d %s", w.Code, w.Body.String())
+	}
+}
+
+func TestReplayStoreFailureFailsClosed(t *testing.T) {
+	g, err := New(Config{SigningKey: strings.Repeat("s", 32), AdminKey: "admin", ReplayStore: failingReplayStore{}, Routes: []Route{{
+		Name: "x", Upstream: "https://example.com", PathPrefix: "/x", Methods: []string{"POST"}, MaxTTLSeconds: 30,
+		RequestSchema: &Schema{Type: "object", Properties: map[string]*Schema{}},
+	}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	token, _ := g.sign(claims{Route: "x", Method: "POST", Path: "/x", JTI: "fail", Exp: time.Now().Add(time.Minute).Unix()})
+	r := httptest.NewRequest("POST", "/proxy/x/x", strings.NewReader(`{}`))
+	r.Header.Set("Authorization", "Bearer "+token)
+	w := httptest.NewRecorder()
+	g.ServeHTTP(w, r)
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status=%d body=%s", w.Code, w.Body.String())
 	}
 }
 
