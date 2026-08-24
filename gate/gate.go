@@ -2,6 +2,7 @@ package gate
 
 import (
 	"bytes"
+	"context"
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
@@ -19,13 +20,31 @@ import (
 )
 
 type Route struct {
-	Name           string   `json:"name"`
-	Upstream       string   `json:"upstream"`
-	PathPrefix     string   `json:"path_prefix"`
-	Methods        []string `json:"methods"`
-	MaxTTLSeconds  int      `json:"max_ttl_seconds"`
-	RequestSchema  *Schema  `json:"request_schema"`
-	UpstreamBearer string   `json:"upstream_bearer,omitempty"`
+	Name           string       `json:"name"`
+	Upstream       string       `json:"upstream"`
+	PathPrefix     string       `json:"path_prefix"`
+	Methods        []string     `json:"methods"`
+	MaxTTLSeconds  int          `json:"max_ttl_seconds"`
+	RequestSchema  *Schema      `json:"request_schema"`
+	UpstreamBearer string       `json:"upstream_bearer,omitempty"`
+	UpstreamAuth   UpstreamAuth `json:"upstream_auth,omitempty"`
+}
+
+// UpstreamAuth describes credentials added by the gate after caller headers
+// have been discarded. Header values should be supplied through secrets, not
+// included in capability tokens.
+type UpstreamAuth struct {
+	Bearer    string            `json:"bearer,omitempty"`
+	BasicUser string            `json:"basic_user,omitempty"`
+	BasicPass string            `json:"basic_pass,omitempty"`
+	Headers   map[string]string `json:"headers,omitempty"`
+	Query     map[string]string `json:"query,omitempty"`
+}
+
+// ReplayStore atomically records a token identifier until its expiry. A
+// distributed implementation can use Redis SET NX with the corresponding TTL.
+type ReplayStore interface {
+	Consume(ctx context.Context, id string, expiresAt time.Time) (bool, error)
 }
 
 type Config struct {
@@ -33,13 +52,14 @@ type Config struct {
 	Routes               []Route
 	MaxBodyBytes         int64
 	Now                  func() time.Time
+	ReplayStore          ReplayStore
+	HTTPClient           *http.Client
 }
 type Gate struct {
 	cfg    Config
 	routes map[string]Route
 	client *http.Client
-	mu     sync.Mutex
-	used   map[string]time.Time
+	replay ReplayStore
 }
 type claims struct {
 	Route, Method, Path, JTI string
@@ -59,7 +79,13 @@ func New(cfg Config) (*Gate, error) {
 	if cfg.Now == nil {
 		cfg.Now = time.Now
 	}
-	g := &Gate{cfg: cfg, routes: map[string]Route{}, used: map[string]time.Time{}, client: &http.Client{Timeout: 30 * time.Second}}
+	if cfg.ReplayStore == nil {
+		cfg.ReplayStore = newMemoryReplayStore(cfg.Now)
+	}
+	if cfg.HTTPClient == nil {
+		cfg.HTTPClient = &http.Client{Timeout: 30 * time.Second}
+	}
+	g := &Gate{cfg: cfg, routes: map[string]Route{}, replay: cfg.ReplayStore, client: cfg.HTTPClient}
 	for _, r := range cfg.Routes {
 		u, err := url.Parse(r.Upstream)
 		if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
@@ -67,6 +93,14 @@ func New(cfg Config) (*Gate, error) {
 		}
 		if r.Name == "" || r.RequestSchema == nil || r.MaxTTLSeconds < 1 || r.MaxTTLSeconds > 300 {
 			return nil, fmt.Errorf("route %q has invalid policy", r.Name)
+		}
+		if r.UpstreamBearer != "" && r.UpstreamAuth.Bearer != "" {
+			return nil, fmt.Errorf("route %q configures bearer authentication twice", r.Name)
+		}
+		for name := range r.UpstreamAuth.Headers {
+			if !validUpstreamHeader(name) {
+				return nil, fmt.Errorf("route %q has forbidden upstream header %q", r.Name, name)
+			}
 		}
 		if r.PathPrefix == "" {
 			r.PathPrefix = "/"
@@ -79,6 +113,15 @@ func New(cfg Config) (*Gate, error) {
 func (g *Gate) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("X-Content-Type-Options", "nosniff")
+	if r.URL.Path == "/healthz" || r.URL.Path == "/readyz" {
+		if r.Method != http.MethodGet {
+			writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "GET required")
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"status":"ok"}`+"\n")
+		return
+	}
 	if r.URL.Path == "/v1/tokens" {
 		g.issue(w, r)
 		return
@@ -162,12 +205,22 @@ func (g *Gate) proxy(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 422, "schema_violation", err.Error())
 		return
 	}
-	if !g.consume(c.JTI, time.Unix(c.Exp, 0)) {
+	consumed, err := g.replay.Consume(r.Context(), c.JTI, time.Unix(c.Exp, 0))
+	if err != nil {
+		writeError(w, 503, "replay_store_unavailable", "token replay protection is unavailable")
+		return
+	}
+	if !consumed {
 		writeError(w, 401, "token_replayed", "token has already been used")
 		return
 	}
 	base, _ := url.Parse(policy.Upstream)
 	target := base.ResolveReference(&url.URL{Path: c.Path})
+	query := target.Query()
+	for key, value := range policy.UpstreamAuth.Query {
+		query.Set(key, value)
+	}
+	target.RawQuery = query.Encode()
 	req, err := http.NewRequestWithContext(r.Context(), r.Method, target.String(), bytes.NewReader(body))
 	if err != nil {
 		writeError(w, 500, "internal_error", "could not build upstream request")
@@ -175,8 +228,17 @@ func (g *Gate) proxy(w http.ResponseWriter, r *http.Request) {
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json")
-	if policy.UpstreamBearer != "" {
-		req.Header.Set("Authorization", "Bearer "+policy.UpstreamBearer)
+	for name, value := range policy.UpstreamAuth.Headers {
+		req.Header.Set(name, value)
+	}
+	bearer := policy.UpstreamAuth.Bearer
+	if bearer == "" {
+		bearer = policy.UpstreamBearer // Backwards compatibility.
+	}
+	if bearer != "" {
+		req.Header.Set("Authorization", "Bearer "+bearer)
+	} else if policy.UpstreamAuth.BasicUser != "" || policy.UpstreamAuth.BasicPass != "" {
+		req.SetBasicAuth(policy.UpstreamAuth.BasicUser, policy.UpstreamAuth.BasicPass)
 	}
 	resp, err := g.client.Do(req)
 	if err != nil {
@@ -184,6 +246,13 @@ func (g *Gate) proxy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		// Never expose an upstream response body; it may contain credentials,
+		// stack traces, or internal service topology.
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, g.cfg.MaxBodyBytes))
+		writeError(w, resp.StatusCode, "upstream_rejected", "upstream rejected the request")
+		return
+	}
 	for _, h := range []string{"Content-Type", "Retry-After"} {
 		if v := resp.Header.Get(h); v != "" {
 			w.Header().Set(h, v)
@@ -224,20 +293,40 @@ func (g *Gate) verify(token string) (claims, error) {
 	}
 	return c, nil
 }
-func (g *Gate) consume(id string, exp time.Time) bool {
-	g.mu.Lock()
-	defer g.mu.Unlock()
-	now := g.cfg.Now()
-	for k, t := range g.used {
-		if now.After(t) {
-			delete(g.used, k)
+
+type memoryReplayStore struct {
+	mu   sync.Mutex
+	used map[string]time.Time
+	now  func() time.Time
+}
+
+func newMemoryReplayStore(now func() time.Time) *memoryReplayStore {
+	return &memoryReplayStore{used: make(map[string]time.Time), now: now}
+}
+
+func (s *memoryReplayStore) Consume(_ context.Context, id string, exp time.Time) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	now := s.now()
+	for key, expiry := range s.used {
+		if !now.Before(expiry) {
+			delete(s.used, key)
 		}
 	}
-	if _, ok := g.used[id]; ok {
+	if _, exists := s.used[id]; exists {
+		return false, nil
+	}
+	s.used[id] = exp
+	return true, nil
+}
+
+func validUpstreamHeader(name string) bool {
+	name = http.CanonicalHeaderKey(name)
+	switch name {
+	case "Authorization", "Connection", "Content-Length", "Host", "Transfer-Encoding":
 		return false
 	}
-	g.used[id] = exp
-	return true
+	return name != ""
 }
 func validPath(path, prefix string) bool {
 	return strings.HasPrefix(path, "/") && !strings.Contains(path, "..") && (path == prefix || strings.HasPrefix(path, strings.TrimSuffix(prefix, "/")+"/"))
