@@ -90,3 +90,18 @@ docker run --rm -p 8080:8080 \
 
 TLS termination and rate limiting should be supplied by the surrounding
 ingress.
+
+## End-to-end example
+
+The [`examples/`](examples/) directory contains a Docker Compose demo with a
+mock ticket API and a dependency-free Python agent. Run the complete capability
+issuance and proxy flow with one command:
+
+```sh
+cd examples
+docker compose up --build --abort-on-container-exit --exit-code-from agent
+```
+
+The agent prints the ticket created through `mcp-gate`, then Compose stops the
+demo services. The example uses public demo credentials and is intended only
+for local evaluation.
