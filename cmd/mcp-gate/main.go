@@ -7,7 +7,7 @@ import (
 	"os"
 	"strconv"
 
-	"github.com/example/mcp-gate/gate"
+	"github.com/ananthaprakashb/mcp-gate/gate"
 )
 
 func main() {
