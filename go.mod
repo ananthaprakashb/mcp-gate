@@ -1,4 +1,4 @@
-module github.com/example/mcp-gate
+module github.com/ananthaprakashb/mcp-gate
 
 go 1.22
 
