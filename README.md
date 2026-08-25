@@ -8,6 +8,10 @@ Before forwarding a request, the gate validates the model-generated JSON against
 
 The project is intentionally small and uses Go's standard library for the core proxy and cryptographic path.
 
+> **Security:** Please read [SECURITY.md](SECURITY.md) for the threat model, supported security assumptions, deployment guidance, and responsible disclosure process.
+>
+> **Contributing:** See [CONTRIBUTING.md](CONTRIBUTING.md) for development setup, testing expectations, security-sensitive contribution guidance, and pull request requirements.
+
 ## Why?
 
 LLM agents often need to call APIs that are much more powerful than the individual action the model is trying to perform.
@@ -98,139 +102,72 @@ export GATE_ROUTES='[
     }
   }
 ]'
-
 go run ./cmd/mcp-gate
 ```
 
-### 1. Issue a capability
-
-The trusted orchestrator requests permission for one execution step:
+Issue a capability for one execution step:
 
 ```sh
 curl -sS http://localhost:8080/v1/tokens \
-  -H "X-Gate-Key: $GATE_ADMIN_KEY" \
-  -H 'Content-Type: application/json' \
+  -H "X-Gate-Key: $GATE_ADMIN_KEY" -H 'Content-Type: application/json' \
   -d '{"route":"tickets","method":"POST","path":"/v1/tickets","ttl_seconds":15}'
 ```
 
-A successful response contains a bearer token scoped to that route, method, exact path, and expiration time.
-
-### 2. Execute the tool call
-
-Send that token only to the matching proxy URL:
+Then send the returned token only to the matching proxy URL:
 
 ```sh
 curl -sS http://localhost:8080/proxy/tickets/v1/tickets \
-  -H "Authorization: Bearer $TOKEN" \
-  -H 'Content-Type: application/json' \
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
   -d '{"title":"Investigate alert","priority":"high"}'
 ```
 
-After one valid execution, replaying the same token is rejected.
+## Security model
 
-## What the gate enforces
+- Policies cap TTL at 300 seconds and constrain route, method, and path.
+- Tokens are consumed only after body validation and cannot be replayed.
+- Object schemas are closed by design; unknown properties are rejected at every object level. Supported constraints are `type`, `properties`, `required`, `items`, `enum`, `pattern`, string lengths, numeric bounds, and array lengths.
+- Upstream credentials never appear in capability tokens or responses. Routes can inject a bearer token, Basic Auth, fixed headers, and fixed query values.
+- Non-2xx upstream bodies are replaced with a stable JSON error so stack traces, internal hostnames, and sensitive response data are not leaked.
+- Request and response bodies are bounded (1 MiB by default); hop-by-hop and caller-supplied authentication headers are not forwarded.
 
-| Control | Behavior |
-| --- | --- |
-| Route scope | Token is bound to one configured route |
-| HTTP method | Token is valid only for the authorized method |
-| Exact path | Proxy request must exactly match the path in the token |
-| Short lifetime | Route policy limits TTL; the hard maximum is 300 seconds |
-| Single use | A successfully validated request consumes the token |
-| Request shape | JSON is validated against a closed schema before forwarding |
-| Secret isolation | Upstream credentials stay in gate configuration, not capability tokens |
-| Error isolation | Non-2xx upstream response bodies are replaced with stable JSON errors |
-| Body limits | Request and response bodies are bounded; default is 1 MiB |
+### Current limitation: capabilities are not argument-bound
 
-## Request validation
+A capability is currently bound to route, method, exact path, TTL, and a unique token ID. The JSON body must match the configured closed schema, but the token does not currently commit to the exact argument values selected by the orchestrator.
 
-Tool arguments are part of the security boundary.
+That means the gate can enforce:
 
-For example, if a tool is intended to accept only:
+> `POST /v1/tickets` once, with only the fields and value ranges allowed by policy.
 
-```json
-{
-  "title": "Investigate alert",
-  "priority": "high"
-}
-```
+It cannot yet enforce:
 
-an agent should not be able to add an undeclared field such as:
+> `POST /v1/tickets` once with exactly this canonical JSON body.
 
-```json
-{
-  "title": "Investigate alert",
-  "priority": "high",
-  "admin": true
-}
-```
+Argument-bound capabilities are a planned extension. One approach is to include a digest of a canonical request representation in the signed claims and compare it before token consumption.
 
-Object schemas in `mcp-gate` are closed by design. Unknown properties are rejected at every object level.
+## What mcp-gate is — and is not
 
-The deliberately small schema implementation currently supports:
+`mcp-gate` is a narrow authorization boundary for LLM/tool execution. It is intended to reduce the authority exposed to an agent and keep upstream credentials outside model context.
 
-- `type`
-- `properties`
-- `required`
-- `items`
-- `enum`
-- `pattern`
-- `minLength` / `maxLength`
-- `minimum` / `maximum`
-- `minItems` / `maxItems`
+It is **not**:
 
-Schema validation occurs **before** token consumption. If the model produces malformed arguments, the caller can correct them without losing the capability. The token is consumed only when the request has passed validation and is ready to be forwarded.
+- an identity provider;
+- a replacement for OAuth, workload identity, mTLS, or service-to-service authentication;
+- a complete policy engine;
+- a full JSON Schema implementation;
+- protection against compromise of the trusted orchestrator, gate host, signing key, or upstream service;
+- a substitute for TLS, ingress authentication, rate limiting, network controls, observability, or secret management.
 
-## Upstream credentials stay server-side
+See [SECURITY.md](SECURITY.md) for the detailed threat model and production deployment expectations.
 
-Routes can inject credentials and fixed request context after caller-supplied authentication headers have been discarded.
+## Distributed replay protection
 
-Supported upstream authentication/configuration includes:
+The default replay store is process-local. Applications embedding `gate` can provide `Config.ReplayStore`, whose atomic `Consume` operation is suitable for a Redis/Valkey `SET key value NX EX ttl` adapter. Store errors fail closed with HTTP 503, so a backend outage cannot silently disable single-use enforcement.
 
-- bearer tokens
-- Basic Auth
-- fixed headers
-- fixed query parameters
+For more than one `mcp-gate` process, a shared replay store is required if single-use behavior must hold across instances.
 
-For example, an agent can call:
+## Operational endpoints
 
-```text
-POST /proxy/tickets/v1/tickets
-Authorization: Bearer <ephemeral-capability>
-```
-
-while `mcp-gate` sends the request upstream with a server-side API key that the model never sees.
-
-## Replay protection
-
-The default replay store is process-local.
-
-Applications embedding the `gate` package can provide `Config.ReplayStore`. Its atomic `Consume` operation is designed so a distributed implementation can use a Redis/Valkey operation such as `SET key value NX EX ttl`.
-
-Replay-store failures fail closed with HTTP 503. A replay backend outage therefore cannot silently turn off single-use enforcement.
-
-For a multi-replica production deployment, use a distributed replay store rather than the default in-memory implementation.
-
-## Safe upstream failures
-
-Upstream error bodies can contain stack traces, internal hostnames, implementation details, or secrets.
-
-For non-2xx responses, `mcp-gate` drains the upstream body but does not return it to the agent. The caller receives a stable JSON error instead.
-
-Caller-provided authentication headers are not forwarded upstream, and sensitive hop-by-hop headers are restricted.
-
-## Health and operations
-
-Liveness and readiness endpoints:
-
-```text
-GET /healthz
-GET /readyz
-```
-
-The executable uses Go's structured `slog` logging.
-
-TLS termination and rate limiting are intentionally expected to be provided by the surrounding ingress or service mesh.
+`GET /healthz` and `GET /readyz` provide liveness and readiness probes. Logs from the executable use Go's structured `slog` format.
 
 ## Container
 
@@ -239,81 +176,14 @@ Build and run the non-root distroless image:
 ```sh
 docker build -t mcp-gate .
 docker run --rm -p 8080:8080 \
-  -e GATE_SIGNING_KEY \
-  -e GATE_ADMIN_KEY \
-  -e GATE_ROUTES \
-  mcp-gate
+  -e GATE_SIGNING_KEY -e GATE_ADMIN_KEY -e GATE_ROUTES mcp-gate
 ```
 
-## Threat model and non-goals
+TLS termination and rate limiting should be supplied by the surrounding ingress.
 
-`mcp-gate` is intentionally narrow. It is an authorization boundary for tool execution, not a complete agent-security platform.
+## CI and verification
 
-### What it is trying to reduce
-
-- exposing long-lived upstream credentials to an LLM or tool executor
-- allowing a capability issued for one endpoint to be reused for another
-- replaying a valid capability multiple times
-- model-generated JSON adding undeclared fields
-- leaking sensitive upstream error bodies back into model context
-
-### What it does not solve
-
-- **Orchestrator compromise.** The holder of `GATE_ADMIN_KEY` is trusted. If it is compromised, an attacker can mint any capability allowed by configured route policies.
-- **Exact argument authorization.** Today the capability is bound to route, method, path, and TTL. The request body must match the configured schema, but the token is not yet bound to the exact argument values approved by the orchestrator.
-- **Identity.** This is not an identity provider and is not a replacement for OAuth, mTLS, workload identity, or user authentication.
-- **Full JSON Schema.** The schema validator is deliberately a small, auditable subset rather than a complete JSON Schema implementation.
-- **Distributed replay protection by default.** The bundled replay store is process-local. Multiple replicas require a shared `ReplayStore` implementation.
-- **Ingress security.** TLS termination, network policy, DDoS protection, and rate limiting belong outside the gate.
-- **The MCP protocol itself.** `mcp-gate` is currently an HTTP authorization proxy intended for MCP-style/LLM tool execution. It is not a full MCP server or MCP transport implementation.
-
-## Why not just OAuth?
-
-OAuth answers an important but different question: **who or what has been granted access?**
-
-`mcp-gate` focuses on reducing authority at the moment an agent executes a tool:
-
-```text
-POST this exact path once within a few seconds.
-```
-
-It can sit behind an existing identity/authentication system rather than replacing one. An orchestrator can authenticate using whatever mechanism the surrounding platform already trusts, then mint a much narrower execution capability for the agent-facing step.
-
-## Why single-use instead of only short-lived?
-
-A 30-second token for a create operation can otherwise mean "create as many objects as possible for 30 seconds."
-
-For many agent steps the intended authority is closer to:
-
-> Perform this operation once.
-
-That is why replay prevention is a first-class part of the design rather than relying on expiration alone.
-
-## Why HMAC?
-
-The current implementation uses HMAC-SHA256 because token issuance and verification happen within the gate trust boundary and the implementation remains compact and auditable.
-
-Asymmetric signing and key rotation are reasonable future directions if deployments need separate issuers/verifiers or more sophisticated key distribution.
-
-## Current roadmap
-
-Areas worth exploring next include:
-
-- **argument-bound capabilities** — bind a token to a canonical request-body hash so the orchestrator can authorize an exact operation, not only a schema-valid one
-- Redis/Valkey replay-store adapters
-- asymmetric signing and key rotation
-- richer policy constraints
-- per-capability rate, cost, or execution budgets
-- structured audit events
-- OpenTelemetry instrumentation
-- MCP-native integration examples
-- Kubernetes deployment examples
-
-The project is intentionally being kept small before expanding the policy surface.
-
-## Security-oriented CI
-
-CI runs:
+The GitHub Actions workflow runs:
 
 ```text
 go test -race ./...
@@ -321,14 +191,28 @@ go vet ./...
 govulncheck ./...
 ```
 
-## Feedback
+Security-sensitive changes should include tests that exercise both the allowed path and the denied/bypass path. See [CONTRIBUTING.md](CONTRIBUTING.md).
 
-The design question behind `mcp-gate` is simple:
+## Roadmap
 
-> Instead of asking whether an agent is broadly authenticated, can we give it only the authority required for the next tool execution — and make that authority expire after one use?
+Potential next steps include:
 
-Feedback, threat-model critiques, integration examples, and pull requests are welcome.
+- argument-bound capabilities;
+- Redis/Valkey replay-store adapters;
+- asymmetric signing and key rotation;
+- richer policy constraints;
+- rate and execution-budget controls;
+- security/audit events;
+- MCP-native integration examples;
+- OpenTelemetry support;
+- Kubernetes deployment examples.
+
+## Contributing
+
+Security reviews, threat-model critiques, implementation feedback, bug reports, and focused pull requests are welcome.
+
+Before contributing, please read [CONTRIBUTING.md](CONTRIBUTING.md). If you believe you have found a vulnerability, **do not open a public issue**; follow the private reporting guidance in [SECURITY.md](SECURITY.md).
 
 ## License
 
-MIT. See [`LICENSE`](LICENSE).
+MIT
