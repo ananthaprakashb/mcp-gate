@@ -10,11 +10,11 @@ What problem, use case, bug, or threat does this address?
 
 Does this change affect any of the following?
 
-- authorization or capability scope
-- token signing, verification, expiry, or claims
-- replay protection
-- schema validation or request parsing
-- upstream routing or credential injection
+- saga state transitions or compensation ordering
+- action idempotency or retry behavior
+- execution-log persistence
+- MCP request parsing
+- action routing or credential injection
 - headers, query handling, or URL construction
 - secret handling
 - error responses or information disclosure
@@ -30,7 +30,7 @@ For security-sensitive changes, include both successful-path and negative/bypass
 
 ## Compatibility / rollout
 
-Describe any impact on configuration, public Go APIs, token behavior, status/error codes, or deployment.
+Describe any impact on configuration, public Go APIs, MCP behavior, saga states, status/error codes, or deployment.
 
 ## Checklist
 

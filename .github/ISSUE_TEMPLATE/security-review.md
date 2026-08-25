@@ -18,7 +18,7 @@ Describe the non-sensitive threat, design concern, or hardening opportunity.
 
 ## Current behavior
 
-What does `mcp-gate` do today?
+What does `semantic-saga-mcp` do today?
 
 ## Proposed improvement
 

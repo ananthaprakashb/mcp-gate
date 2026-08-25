@@ -22,7 +22,7 @@ Provide the smallest reproducible example. Remove all real credentials, tokens, 
 
 ## Environment
 
-- `mcp-gate` commit/release:
+- `semantic-saga-mcp` commit/release:
 - Go version:
 - OS/container environment:
 - Deployment topology (single instance / multiple instances):

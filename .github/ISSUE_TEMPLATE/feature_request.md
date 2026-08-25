@@ -1,6 +1,6 @@
 ---
 name: Feature request
-description: Propose a focused feature or protocol change for mcp-gate.
+description: Propose a focused feature or protocol change for semantic-saga-mcp.
 title: "feat: "
 labels: []
 assignees: []

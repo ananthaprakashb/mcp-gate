@@ -5,7 +5,7 @@
     "llm",
     "ai-agents",
     "agent-security",
-    "capability-security",
+    "compensating-transactions",
     "authorization",
     "go",
     "security"

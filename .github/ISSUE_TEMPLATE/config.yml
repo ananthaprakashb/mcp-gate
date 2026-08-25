@@ -1,5 +1,5 @@
 blank_issues_enabled: true
 contact_links:
   - name: Security vulnerability
-    url: https://github.com/ananthaprakashb/mcp-gate/security
+    url: https://github.com/ananthaprakashb/semantic-saga-mcp/security
     about: Do not disclose exploitable vulnerabilities in public issues. Follow SECURITY.md and use private vulnerability reporting when available.
